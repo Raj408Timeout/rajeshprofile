@@ -1,0 +1,268 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy (e.g., a1b2c3d4 from ACR). Leave blank to use staging-latest.'
+        required: false
+        default: ''
+      confirm_production:
+        description: 'Type "deploy-to-production" to confirm you intend to deploy to the live environment.'
+        required: true
+
+jobs:
+  # ===================================================================
+  # Validate Deployment Confirmation
+  # ===================================================================
+  validate-confirmation:
+    name: Validate Deployment Confirmation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check confirmation input
+        run: |
+          if [ "${{ github.event.inputs.confirm_production }}" != "deploy-to-production" ]; then
+            echo "ERROR: Confirmation phrase incorrect."
+            echo "You typed: '${{ github.event.inputs.confirm_production }}'"
+            echo "Expected: 'deploy-to-production'"
+            echo "Production deployment aborted."
+            exit 1
+          fi
+          echo "Confirmation accepted. Proceeding with production deployment."
+
+      - name: Log deployment intent
+        run: |
+          echo "Production deployment initiated by: ${{ github.actor }}"
+          echo "Image tag: ${{ github.event.inputs.image_tag || 'staging-latest' }}"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+  # ===================================================================
+  # Deploy Angular Portal to Production (Static Web Apps)
+  # ===================================================================
+  deploy-angular-production:
+    name: Deploy Angular Portal (Production)
+    runs-on: ubuntu-latest
+    needs: validate-confirmation
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Angular portal for production
+        working-directory: apps/portal-angular
+        env:
+          API_BASE_URL: ${{ secrets.PROD_PROFILE_SERVICE_URL }}
+          NODE_ENV: production
+        run: npm run build
+
+      - name: Deploy to Azure Static Web Apps (Production)
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_PROD }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: apps/portal-angular
+          output_location: dist/portal-angular/browser
+
+  # ===================================================================
+  # Blue/Green Deploy Backend Services to Production
+  # Strategy:
+  #   1. Update Container App with new image (new revision created automatically)
+  #   2. New revision starts with 0% traffic (staged rollout)
+  #   3. Run health check on new revision
+  #   4. Shift 100% traffic to new revision
+  #   5. Deactivate old revision
+  # ===================================================================
+  deploy-profile-service-production:
+    name: Blue/Green Deploy Profile Service (Production)
+    runs-on: ubuntu-latest
+    needs: validate-confirmation
+    environment: production
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Determine image tag
+        id: image_tag
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="staging-latest"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create new revision for profile-service
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Enable multiple revisions for traffic splitting
+            az containerapp revision set-mode \
+              --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --mode multiple
+
+            # Update the image — this creates a new inactive revision
+            az containerapp update \
+              --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --image ${{ secrets.ACR_LOGIN_SERVER }}/profile-service:${{ steps.image_tag.outputs.tag }} \
+              --revision-suffix blue-$(date +%Y%m%d%H%M)
+
+      - name: Wait for new revision to start
+        run: sleep 20
+
+      - name: Get new revision name
+        id: new_revision
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            NEW_REV=$(az containerapp revision list \
+              --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --query "[?properties.active==true] | sort_by(@, &properties.createdTime) | [-1].name" \
+              --output tsv)
+            echo "revision=$NEW_REV" >> $GITHUB_OUTPUT
+
+      - name: Health check on new revision
+        run: |
+          NEW_REV_URL=$(az containerapp revision show \
+            --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --revision ${{ steps.new_revision.outputs.revision }} \
+            --query "properties.fqdn" \
+            --output tsv)
+
+          for i in {1..5}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "https://$NEW_REV_URL/health" 2>/dev/null || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "New revision health check passed."
+              break
+            fi
+            echo "Attempt $i: health check returned $status. Retrying in 10s..."
+            sleep 10
+          done
+
+          if [ "$status" != "200" ]; then
+            echo "New revision failed health checks. Aborting traffic shift."
+            exit 1
+          fi
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Shift 100% traffic to new revision
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az containerapp ingress traffic set \
+              --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --revision-weight ${{ steps.new_revision.outputs.revision }}=100
+
+      - name: Deactivate old revisions
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            OLD_REVS=$(az containerapp revision list \
+              --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --query "[?properties.active==true && name!='${{ steps.new_revision.outputs.revision }}'].name" \
+              --output tsv)
+
+            for rev in $OLD_REVS; do
+              echo "Deactivating old revision: $rev"
+              az containerapp revision deactivate \
+                --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }} \
+                --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+                --revision "$rev"
+            done
+
+  # ===================================================================
+  # Blue/Green Deploy AI Orchestration Service (same pattern)
+  # ===================================================================
+  deploy-ai-service-production:
+    name: Blue/Green Deploy AI Service (Production)
+    runs-on: ubuntu-latest
+    needs: validate-confirmation
+    environment: production
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Determine image tag
+        id: image_tag
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="staging-latest"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Deploy new revision for ai-orchestration-service
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az containerapp update \
+              --name ${{ secrets.AI_SERVICE_CONTAINER_APP_NAME }} \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --image ${{ secrets.ACR_LOGIN_SERVER }}/ai-orchestration-service:${{ steps.image_tag.outputs.tag }}
+
+  # ===================================================================
+  # Post-Deployment Smoke Tests
+  # ===================================================================
+  post-deploy-smoke-tests:
+    name: Post-Deployment Smoke Tests (Production)
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-angular-production
+      - deploy-profile-service-production
+      - deploy-ai-service-production
+
+    steps:
+      - name: Wait for deployments to stabilize
+        run: sleep 30
+
+      - name: Smoke test — Profile Service health
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.PROD_PROFILE_SERVICE_URL }}/health)
+          [ "$status" = "200" ] && echo "Profile service: OK" || (echo "Profile service: FAILED ($status)" && exit 1)
+
+      - name: Smoke test — Profile API
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.PROD_PROFILE_SERVICE_URL }}/api/v1/profile)
+          [ "$status" = "200" ] && echo "Profile API: OK" || (echo "Profile API: FAILED ($status)" && exit 1)
+
+      - name: Smoke test — AI Service health
+        run: |
+          status=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.PROD_AI_SERVICE_URL }}/health)
+          [ "$status" = "200" ] && echo "AI service: OK" || (echo "AI service: FAILED ($status)" && exit 1)
+
+      - name: Production deployment summary
+        run: |
+          echo "================================================"
+          echo "Production Deployment Complete"
+          echo "Image tag: ${{ github.event.inputs.image_tag || 'staging-latest' }}"
+          echo "Deployed by: ${{ github.actor }}"
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "================================================"

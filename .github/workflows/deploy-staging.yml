@@ -1,0 +1,203 @@
+name: Deploy to Staging
+
+on:
+  workflow_run:
+    workflows: ['CI — Lint, Test, Build']
+    types:
+      - completed
+    branches:
+      - main
+
+# Only run if CI passed
+jobs:
+  check-ci-status:
+    name: Verify CI Passed
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: CI passed confirmation
+        run: echo "CI passed on main. Proceeding with staging deployment."
+
+  # ===================================================================
+  # Build and Push Docker Images to Azure Container Registry
+  # ===================================================================
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    needs: check-ci-status
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image tag from git SHA
+        id: meta
+        run: echo "image_tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push profile-service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend/profile-service
+          file: ./backend/profile-service/Dockerfile
+          push: true
+          target: production
+          tags: |
+            ${{ secrets.ACR_LOGIN_SERVER }}/profile-service:${{ steps.meta.outputs.image_tag }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/profile-service:staging-latest
+          cache-from: type=registry,ref=${{ secrets.ACR_LOGIN_SERVER }}/profile-service:staging-latest
+          cache-to: type=inline
+
+      - name: Build and push ai-orchestration-service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend/ai-orchestration-service
+          file: ./backend/ai-orchestration-service/Dockerfile
+          push: true
+          target: production
+          tags: |
+            ${{ secrets.ACR_LOGIN_SERVER }}/ai-orchestration-service:${{ steps.meta.outputs.image_tag }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/ai-orchestration-service:staging-latest
+          cache-from: type=registry,ref=${{ secrets.ACR_LOGIN_SERVER }}/ai-orchestration-service:staging-latest
+          cache-to: type=inline
+
+      - name: Build and push React dashboard image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/ai-dashboard-react
+          file: ./apps/ai-dashboard-react/Dockerfile
+          push: true
+          target: production
+          tags: |
+            ${{ secrets.ACR_LOGIN_SERVER }}/ai-dashboard-react:${{ steps.meta.outputs.image_tag }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/ai-dashboard-react:staging-latest
+          cache-from: type=registry,ref=${{ secrets.ACR_LOGIN_SERVER }}/ai-dashboard-react:staging-latest
+          cache-to: type=inline
+
+  # ===================================================================
+  # Deploy Angular Portal to Static Web Apps (Staging Slot)
+  # ===================================================================
+  deploy-angular-staging:
+    name: Deploy Angular Portal (Staging)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Angular portal for staging
+        working-directory: apps/portal-angular
+        env:
+          API_BASE_URL: ${{ secrets.STAGING_PROFILE_SERVICE_URL }}
+          NODE_ENV: production
+        run: npm run build
+
+      - name: Deploy to Azure Static Web Apps (Staging)
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: apps/portal-angular
+          output_location: dist/portal-angular/browser
+          deployment_environment: staging
+
+  # ===================================================================
+  # Deploy Backend Services to Azure Container Apps (Staging)
+  # ===================================================================
+  deploy-backends-staging:
+    name: Deploy Backend Services (Staging)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: staging
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update profile-service Container App (staging)
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az containerapp update \
+              --name ${{ secrets.PROFILE_SERVICE_CONTAINER_APP_NAME }}-staging \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --image ${{ secrets.ACR_LOGIN_SERVER }}/profile-service:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Update ai-service Container App (staging)
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az containerapp update \
+              --name ${{ secrets.AI_SERVICE_CONTAINER_APP_NAME }}-staging \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --image ${{ secrets.ACR_LOGIN_SERVER }}/ai-orchestration-service:${{ needs.build-and-push.outputs.image_tag }}
+
+  # ===================================================================
+  # Smoke Tests Against Staging Environment
+  # ===================================================================
+  smoke-tests-staging:
+    name: Smoke Tests (Staging)
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-angular-staging
+      - deploy-backends-staging
+
+    steps:
+      - name: Wait for services to be ready
+        run: sleep 30
+
+      - name: Test profile service health endpoint
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.STAGING_PROFILE_SERVICE_URL }}/health)
+          if [ "$response" -ne 200 ]; then
+            echo "Profile service health check failed with status: $response"
+            exit 1
+          fi
+          echo "Profile service health: OK ($response)"
+
+      - name: Test profile API endpoint
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.STAGING_PROFILE_SERVICE_URL }}/api/v1/profile)
+          if [ "$response" -ne 200 ]; then
+            echo "Profile API endpoint failed with status: $response"
+            exit 1
+          fi
+          echo "Profile API endpoint: OK ($response)"
+
+      - name: Test AI service health endpoint
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.STAGING_AI_SERVICE_URL }}/health)
+          if [ "$response" -ne 200 ]; then
+            echo "AI service health check failed with status: $response"
+            exit 1
+          fi
+          echo "AI service health: OK ($response)"
+
+      - name: Notify on staging deployment success
+        run: echo "Staging deployment succeeded for commit ${{ github.sha }}"

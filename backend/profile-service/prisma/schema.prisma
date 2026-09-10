@@ -1,0 +1,267 @@
+// =====================================================================
+// Prisma Schema — Rajesh Profile Portal
+// Database: PostgreSQL 16
+// Generator: Prisma Client v5.x
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+// Enums
+// =====================================================================
+
+/// Skill domain groupings for display organization
+enum SkillCategory {
+  AI_ML
+  FRONTEND
+  BACKEND
+  CLOUD
+  DATABASE
+  DEVOPS
+  ENTERPRISE
+  SOFT_SKILLS
+}
+
+/// Proficiency levels for skills, ordered from highest to lowest
+enum ProficiencyLevel {
+  EXPERT
+  ADVANCED
+  INTERMEDIATE
+  BEGINNER
+}
+
+/// Project lifecycle states
+enum ProjectStatus {
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+}
+
+/// Employment arrangement types
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  FREELANCE
+}
+
+/// AI features that consume tokens — used for cost attribution
+enum AIFeature {
+  JD_ANALYZER
+  PROFILE_ADAPTER
+  RESUME_GENERATOR
+  RECOMMENDATION_ENGINE
+  RAG_QUERY
+  EMBEDDING_GENERATION
+}
+
+// =====================================================================
+// Profile — The top-level entity for Rajesh's professional profile
+// =====================================================================
+
+model Profile {
+  id           String   @id @default(uuid())
+  fullName     String   @db.VarChar(100)
+  title        String   @db.VarChar(200)
+  summary      String   @db.Text
+  email        String   @unique @db.VarChar(255)
+  location     String?  @db.VarChar(100)
+  linkedinUrl  String?  @db.VarChar(500)
+  githubUrl    String?  @db.VarChar(500)
+  portfolioUrl String?  @db.VarChar(500)
+  createdAt    DateTime @default(now()) @db.Timestamptz
+  updatedAt    DateTime @updatedAt @db.Timestamptz
+
+  // Relations
+  skills         Skill[]
+  experiences    Experience[]
+  projects       Project[]
+  certifications Certification[]
+
+  @@map("profiles")
+}
+
+// =====================================================================
+// Skill — A technical or professional skill belonging to a profile
+// =====================================================================
+
+model Skill {
+  id                String         @id @default(uuid())
+  profileId         String
+  name              String         @db.VarChar(100)
+  category          SkillCategory
+  proficiency       ProficiencyLevel
+  yearsOfExperience Decimal?       @db.Decimal(3, 1)
+  isPrimary         Boolean        @default(false)
+  createdAt         DateTime       @default(now()) @db.Timestamptz
+
+  // Relations
+  profile           Profile        @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  experienceSkills  ExperienceSkill[]
+  projectSkills     ProjectSkill[]
+
+  @@index([profileId, category])
+  @@index([profileId, proficiency])
+  @@map("skills")
+}
+
+// =====================================================================
+// Experience — A professional role or position
+// =====================================================================
+
+model Experience {
+  id             String         @id @default(uuid())
+  profileId      String
+  companyName    String         @db.VarChar(200)
+  roleTitle      String         @db.VarChar(200)
+  employmentType EmploymentType
+  startDate      DateTime       @db.Date
+  endDate        DateTime?      @db.Date
+  isCurrent      Boolean        @default(false)
+  summary        String         @db.Text
+  highlights     Json           @default("[]")  // String[] stored as JSONB
+  location       String?        @db.VarChar(100)
+  createdAt      DateTime       @default(now()) @db.Timestamptz
+  updatedAt      DateTime       @updatedAt @db.Timestamptz
+
+  // Relations
+  profile        Profile        @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  skills         ExperienceSkill[]
+
+  @@index([profileId])
+  @@index([profileId, isCurrent])
+  @@map("experiences")
+}
+
+// =====================================================================
+// ExperienceSkill — Junction table linking experiences to skills
+// =====================================================================
+
+model ExperienceSkill {
+  experienceId String
+  skillId      String
+
+  experience   Experience @relation(fields: [experienceId], references: [id], onDelete: Cascade)
+  skill        Skill      @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@id([experienceId, skillId])
+  @@map("experience_skills")
+}
+
+// =====================================================================
+// Project — A technical or product project
+// =====================================================================
+
+model Project {
+  id                  String        @id @default(uuid())
+  profileId           String
+  name                String        @db.VarChar(200)
+  slug                String        @unique @db.VarChar(200)
+  description         String        @db.Text
+  detailedDescription String?       @db.Text
+  techStack           Json          @default("[]")  // String[] stored as JSONB
+  githubUrl           String?       @db.VarChar(500)
+  demoUrl             String?       @db.VarChar(500)
+  status              ProjectStatus @default(ACTIVE)
+  isFeatured          Boolean       @default(false)
+  sortOrder           Int           @default(0)
+  startDate           DateTime?     @db.Date
+  endDate             DateTime?     @db.Date
+  createdAt           DateTime      @default(now()) @db.Timestamptz
+  updatedAt           DateTime      @updatedAt @db.Timestamptz
+
+  // Relations
+  profile             Profile       @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  skills              ProjectSkill[]
+
+  @@index([profileId, isFeatured])
+  @@index([sortOrder])
+  @@map("projects")
+}
+
+// =====================================================================
+// ProjectSkill — Junction table linking projects to skills
+// =====================================================================
+
+model ProjectSkill {
+  projectId String
+  skillId   String
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  skill     Skill   @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, skillId])
+  @@map("project_skills")
+}
+
+// =====================================================================
+// Certification — A professional certification or credential
+// =====================================================================
+
+model Certification {
+  id                   String   @id @default(uuid())
+  profileId            String
+  name                 String   @db.VarChar(300)
+  issuingOrganization  String   @db.VarChar(200)
+  issueDate            DateTime @db.Date
+  expiryDate           DateTime? @db.Date
+  credentialId         String?  @db.VarChar(200)
+  credentialUrl        String?  @db.VarChar(500)
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now()) @db.Timestamptz
+
+  // Relations
+  profile              Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId, isActive])
+  @@map("certifications")
+}
+
+// =====================================================================
+// TokenUsageLog — Append-only log of every AI API call
+// =====================================================================
+
+model TokenUsageLog {
+  id               String     @id @default(uuid())
+  feature          AIFeature
+  modelId          String     @db.VarChar(100)
+  promptTokens     Int
+  completionTokens Int
+  totalTokens      Int
+  estimatedCostUsd Decimal    @db.Decimal(10, 6)
+  cacheHit         Boolean    @default(false)
+  jdHash           String?    @db.VarChar(64)
+  durationMs       Int?
+  createdAt        DateTime   @default(now()) @db.Timestamptz
+
+  @@index([createdAt(sort: Desc)])
+  @@index([feature, createdAt(sort: Desc)])
+  @@map("token_usage_logs")
+}
+
+// =====================================================================
+// JdAnalysisCache — Persistent cache for JD analysis results
+// (Redis is the primary cache; this serves as a durable fallback)
+// =====================================================================
+
+model JdAnalysisCache {
+  id              String   @id @default(uuid())
+  jdHash          String   @unique @db.VarChar(64)
+  jdTextPreview   String?  @db.VarChar(500)
+  analysisResult  Json                          // JDAnalysisResponse stored as JSONB
+  modelId         String   @db.VarChar(100)
+  hitCount        Int      @default(0)
+  createdAt       DateTime @default(now()) @db.Timestamptz
+  lastAccessedAt  DateTime @default(now()) @db.Timestamptz
+  expiresAt       DateTime @db.Timestamptz
+
+  @@index([expiresAt])
+  @@map("jd_analysis_cache")
+}

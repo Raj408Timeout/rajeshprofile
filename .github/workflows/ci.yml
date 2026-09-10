@@ -1,0 +1,310 @@
+name: CI — Lint, Test, Build
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'fix/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ===================================================================
+  # Job 1: Lint and Type Check
+  # Fast feedback — fails early on code quality issues
+  # ===================================================================
+  lint-and-type-check:
+    name: Lint and Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Turborepo lint
+        run: npx turbo run lint
+
+      - name: TypeScript type check (all workspaces)
+        run: npx turbo run type-check
+
+      - name: Check Prettier formatting
+        run: npx prettier --check "**/*.{ts,tsx,js,json}"
+
+  # ===================================================================
+  # Job 2: Test Backend Services
+  # Unit + integration tests for profile-service and ai-orchestration-service
+  # ===================================================================
+  test-backend:
+    name: Test Backend Services
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: rajesh_profile_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        working-directory: backend/profile-service
+        run: npx prisma generate
+
+      - name: Run database migrations for test DB
+        working-directory: backend/profile-service
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/rajesh_profile_test
+        run: npx prisma migrate deploy
+
+      - name: Run profile-service tests
+        working-directory: backend/profile-service
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/rajesh_profile_test
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+        run: npm test -- --coverage --passWithNoTests
+
+      - name: Run ai-orchestration-service tests
+        working-directory: backend/ai-orchestration-service
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/rajesh_profile_test
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+          # AI tests use mocked Anthropic client — no real API key needed
+          ANTHROPIC_API_KEY: test-mock-key
+        run: npm test -- --coverage --passWithNoTests
+
+      - name: Upload backend test coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: |
+            backend/profile-service/coverage/
+            backend/ai-orchestration-service/coverage/
+          retention-days: 7
+
+  # ===================================================================
+  # Job 3: Test Frontend Applications
+  # Unit tests for Angular portal and React dashboard
+  # ===================================================================
+  test-frontend:
+    name: Test Frontend Applications
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Angular portal tests (headless Chrome)
+        working-directory: apps/portal-angular
+        run: npm test -- --watch=false --browsers=ChromeHeadless --code-coverage --passWithNoTests
+
+      - name: Run React dashboard tests
+        working-directory: apps/ai-dashboard-react
+        run: npm test -- --run --passWithNoTests
+
+      - name: Upload frontend test coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: |
+            apps/portal-angular/coverage/
+            apps/ai-dashboard-react/coverage/
+          retention-days: 7
+
+  # ===================================================================
+  # Job 4: Build All Applications
+  # Confirms production builds succeed with no errors
+  # Depends on test jobs passing first
+  # ===================================================================
+  build:
+    name: Build All Applications
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - lint-and-type-check
+      - test-backend
+      - test-frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        working-directory: backend/profile-service
+        run: npx prisma generate
+
+      - name: Build all workspaces (Turborepo)
+        run: npx turbo run build
+        env:
+          # Angular build needs these at build time
+          API_BASE_URL: https://api.rajeshkumar.dev
+          # Prevent Turbo from trying to read secrets during build
+          TURBO_TEAM: ''
+          TURBO_TOKEN: ''
+
+      - name: Verify build artifacts exist
+        run: |
+          echo "Checking build artifacts..."
+          [ -d "packages/shared-types/dist" ] && echo "shared-types: OK" || echo "shared-types: MISSING"
+          [ -d "backend/profile-service/dist" ] && echo "profile-service: OK" || echo "profile-service: MISSING"
+          [ -d "backend/ai-orchestration-service/dist" ] && echo "ai-service: OK" || echo "ai-service: MISSING"
+
+      - name: Upload shared-types build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-types-dist
+          path: packages/shared-types/dist/
+          retention-days: 1
+
+  # ===================================================================
+  # Job 5: Security Scan with CodeQL
+  # Static analysis for JavaScript/TypeScript security vulnerabilities
+  # Runs in parallel with tests for faster overall CI time
+  # ===================================================================
+  security-scan:
+    name: Security Scan (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript-typescript'
+
+      - name: Run npm audit (dependency vulnerability check)
+        run: npm audit --audit-level=high
+        continue-on-error: true  # Report but don't fail CI on audit issues (use Dependabot for remediation)
+
+  # ===================================================================
+  # CI Summary — Runs after all jobs to provide a single status check
+  # ===================================================================
+  ci-complete:
+    name: CI Complete
+    runs-on: ubuntu-latest
+    needs:
+      - lint-and-type-check
+      - test-backend
+      - test-frontend
+      - build
+      - security-scan
+    if: always()
+    steps:
+      - name: Check all jobs succeeded
+        run: |
+          if [[ "${{ needs.lint-and-type-check.result }}" != "success" ]]; then
+            echo "lint-and-type-check failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-backend.result }}" != "success" ]]; then
+            echo "test-backend failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-frontend.result }}" != "success" ]]; then
+            echo "test-frontend failed"
+            exit 1
+          fi
+          if [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "build failed"
+            exit 1
+          fi
+          echo "All CI jobs passed!"

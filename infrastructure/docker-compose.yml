@@ -1,0 +1,227 @@
+version: '3.9'
+
+# =====================================================================
+# Rajesh Profile Portal — Local Development Services
+# Usage: docker-compose up -d postgres redis pgadmin
+# Then run Node.js services natively for faster HMR
+# =====================================================================
+
+networks:
+  rajesh-profile-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+services:
+
+  # ===================================================================
+  # PostgreSQL 16 — Primary Database
+  # ===================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: rajesh-profile-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: rajesh_profile_dev
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - rajesh-profile-network
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d rajesh_profile_dev']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===================================================================
+  # Redis 7 — Caching Layer (JD analysis cache, session store)
+  # ===================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: rajesh-profile-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning --requirepass redispassword
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    networks:
+      - rajesh-profile-network
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-a', 'redispassword', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ===================================================================
+  # pgAdmin 4 — PostgreSQL Management UI
+  # Access at: http://localhost:5050
+  # Login: admin@rajesh.dev / adminpassword
+  # ===================================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: rajesh-profile-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@rajesh.dev
+      PGADMIN_DEFAULT_PASSWORD: adminpassword
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    ports:
+      - '5050:80'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - rajesh-profile-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ===================================================================
+  # Profile Service — Node.js REST API for profile data
+  # Run natively during development for HMR; use this for integration testing
+  # ===================================================================
+  profile-service:
+    build:
+      context: ../backend/profile-service
+      dockerfile: Dockerfile
+      target: development
+    container_name: rajesh-profile-service
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/rajesh_profile_dev
+      REDIS_URL: redis://:redispassword@redis:6379
+      ALLOWED_ORIGINS: http://localhost:3000,http://localhost:4200
+      SMTP_HOST: smtp.sendgrid.net
+      SMTP_PORT: '587'
+      SMTP_USER: apikey
+      SMTP_PASS: ${SMTP_PASS:-placeholder}
+      CONTACT_EMAIL_TO: rajeshkumar@example.com
+      RATE_LIMIT_WINDOW_MS: '3600000'
+      RATE_LIMIT_MAX_REQUESTS: '10'
+    ports:
+      - '3001:3001'
+    volumes:
+      - ../backend/profile-service:/app
+      - /app/node_modules
+    networks:
+      - rajesh-profile-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:3001/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ===================================================================
+  # AI Orchestration Service — Node.js AI feature service
+  # ===================================================================
+  ai-service:
+    build:
+      context: ../backend/ai-orchestration-service
+      dockerfile: Dockerfile
+      target: development
+    container_name: rajesh-ai-service
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/rajesh_profile_dev
+      REDIS_URL: redis://:redispassword@redis:6379
+      PROFILE_SERVICE_URL: http://profile-service:3001
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-your_anthropic_api_key_here}
+      VERTEX_AI_PROJECT_ID: ${VERTEX_AI_PROJECT_ID:-your_gcp_project_id}
+      VERTEX_AI_LOCATION: us-central1
+      ALLOWED_ORIGINS: http://localhost:3000,http://localhost:4200
+      TOKEN_BUDGET_MONTHLY_USD: '20.00'
+      TOKEN_ALERT_THRESHOLD_PERCENT: '80'
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-local-dev-admin-key-change-in-prod}
+    ports:
+      - '3002:3002'
+    volumes:
+      - ../backend/ai-orchestration-service:/app
+      - /app/node_modules
+    networks:
+      - rajesh-profile-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      profile-service:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:3002/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ===================================================================
+  # Angular Portal — Public-facing profile site
+  # Volume mounts enable hot reload during development
+  # ===================================================================
+  angular-portal:
+    build:
+      context: ../apps/portal-angular
+      dockerfile: Dockerfile
+      target: development
+    container_name: rajesh-angular-portal
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://localhost:3001
+    ports:
+      - '4200:4200'
+    volumes:
+      - ../apps/portal-angular:/app
+      - /app/node_modules
+      - /app/.angular
+    networks:
+      - rajesh-profile-network
+    depends_on:
+      - profile-service
+    stdin_open: true
+
+  # ===================================================================
+  # React Dashboard — Private AI tools dashboard
+  # ===================================================================
+  react-dashboard:
+    build:
+      context: ../apps/ai-dashboard-react
+      dockerfile: Dockerfile
+      target: development
+    container_name: rajesh-react-dashboard
+    restart: unless-stopped
+    environment:
+      VITE_PROFILE_API_URL: http://localhost:3001
+      VITE_AI_API_URL: http://localhost:3002
+      VITE_ADMIN_API_KEY: ${ADMIN_API_KEY:-local-dev-admin-key-change-in-prod}
+    ports:
+      - '3000:3000'
+    volumes:
+      - ../apps/ai-dashboard-react:/app
+      - /app/node_modules
+    networks:
+      - rajesh-profile-network
+    depends_on:
+      - ai-service
