@@ -1,26 +1,26 @@
-# ADR-004: Node.js TypeScript as Primary Backend Language
+# ADR-004: Python + FastAPI as Backend Language
 
-**Status:** Accepted  
-**Date:** 2026-08-07  
+**Status:** Superseded (replaces Node.js decision from 2026-08-07)  
+**Date:** 2026-09-15  
 **Deciders:** Rajeshkumar Kalaimani
 
 ---
 
 ## Context
 
-The project requires two backend services: a Profile Service (CRUD operations, email sending) and an AI Orchestration Service (LLM API integration, caching, token tracking). Both are relatively simple HTTP servers without heavy computational requirements.
+The original ADR-004 (2026-08-07) selected Node.js + TypeScript as the backend language for the profile-service, primarily for monorepo type-sharing with the Angular/React frontends.
 
-Rajesh has experience with Python (AI/ML work), Node.js/TypeScript (web APIs), and has exposure to .NET. The backend language choice affects:
-- Integration with the shared-types TypeScript package
-- Ecosystem compatibility with the AI SDKs (Anthropic, Vertex AI)
-- Consistency with the frontend workspaces in the monorepo
-- Learning objectives for the project
+After implementing Phase 2, a pragmatic reassessment was made: Rajeshkumar's deepest comfort and daily practice is in Python. The profile-service and future AI orchestration service involve database access, REST API design, and LLM SDK integration — all areas where the Python ecosystem is equally strong (and for AI work, often stronger).
+
+The shared-types argument (TypeScript on both frontend and backend enables direct interface sharing) was evaluated against the practical cost: maintaining Node.js backend code as a secondary language slows iteration speed and reduces code quality when the developer is less fluent.
 
 ---
 
 ## Decision
 
-Use **Node.js 20 with TypeScript** as the backend language for both services, using Express as the HTTP framework.
+Use **Python 3.12+ with FastAPI** as the backend language for both services.
+
+Replace the Node.js/Express implementation of profile-service with a Python/FastAPI equivalent. Use SQLAlchemy 2.0 (async) as the ORM and Alembic for migrations.
 
 ---
 
@@ -28,58 +28,50 @@ Use **Node.js 20 with TypeScript** as the backend language for both services, us
 
 ### Positive
 
-**Monorepo type sharing:** The shared-types package (`packages/shared-types`) exports TypeScript interfaces consumed by both frontends and backends. If backends are in TypeScript, the type sharing is seamless — no code generation, no schema sync, no translation layer. Changing `JDAnalysisResponse` in shared-types causes immediate compile errors in both the AI service and the React dashboard, catching breaking changes at development time.
+**Primary language advantage:** Python is Rajeshkumar's strongest backend language (4 years, Advanced proficiency). Code written in a developer's primary language is clearer, more idiomatic, and less error-prone. The quality ceiling is higher.
 
-**Single language across the stack:** A solo developer maintains one mental model for language idioms, error handling patterns, async/await semantics, and tooling. Debugging a request from the Angular frontend through the Profile Service backend involves the same language constructs throughout.
+**AI ecosystem alignment:** The Anthropic Python SDK (`anthropic`), LangChain, LlamaIndex, and all embedding/vector store libraries are Python-first. When Phase 3 adds Claude API integration and Phase 6 adds RAG, Python is the natural home for that work.
 
-**SDK ecosystem:** The Anthropic SDK (`@anthropic-ai/sdk`) and Google Cloud AI Platform SDK (`@google-cloud/aiplatform`) both have official, well-maintained Node.js TypeScript packages. Python alternatives exist, but using them would require a separate Python service or breaking the monorepo language unity.
+**FastAPI is production-grade:** FastAPI provides automatic OpenAPI docs (`/docs`), Pydantic validation, async-native request handling, and dependency injection — comparable to or better than Express for this use case.
 
-**npm ecosystem:** The Node.js ecosystem has excellent libraries for all requirements: Express, Prisma, ioredis, zod, nodemailer, pino for logging, jest and supertest for testing. All are well-maintained and have TypeScript support.
+**Pydantic v2 replaces Zod:** Pydantic is the Python equivalent of Zod for runtime validation and schema declaration. The validation semantics (`field_validator`, required fields, type coercion) are nearly identical.
 
-**Async I/O fit:** Both services are I/O-bound (database queries, HTTP calls to AI APIs). Node.js's event loop handles I/O-bound workloads efficiently without requiring multi-threading.
+**asyncio native:** Python's `asyncio` + `asyncpg` handles the same async I/O workloads as Node.js's event loop. SQLAlchemy 2.0 async is production-ready.
 
 ### Negative
 
-**Python is stronger for AI/ML work:** If the AI service ever needed to run local model inference, process large datasets, or integrate with Python-specific AI libraries (LangChain, Hugging Face Transformers, scikit-learn), Node.js would be a poor fit. For this project's use case (calling external API endpoints), Node.js is appropriate.
+**Shared-types package becomes frontend-only:** The `packages/shared-types` TypeScript interfaces are no longer shared with the backend. Instead:
+- Frontend TypeScript interfaces live in `packages/shared-types/`
+- Backend Pydantic schemas live in `backend/profile-service/app/schemas/`
+- These must stay in sync manually (or via OpenAPI code generation in Phase 7)
 
-**Express is not the fastest framework:** Express's middleware chain has measurable overhead compared to Fastify or Hono. For a low-traffic personal portfolio, this is irrelevant, but it is worth noting for future scaling.
+**Mitigation:** Both the Angular models and the FastAPI Pydantic schemas are small and change infrequently. A mismatch is caught immediately by integration tests (Phase 2+). OpenAPI auto-generation from FastAPI (`/openapi.json`) can bootstrap TypeScript types automatically when needed.
 
-**Prisma is Node.js-specific:** If the backend language changes later, Prisma would need to be replaced with another ORM.
+**Two languages in the monorepo:** TypeScript (frontend) + Python (backend) requires context switching. This is accepted as a deliberate skill-demonstration choice — showing full-stack capability across both dominant AI engineering languages.
 
 ---
 
-## Alternatives Considered
+## Tech Stack for Python Backend
 
-### Python with FastAPI
+| Concern | Library | Rationale |
+|---------|---------|-----------|
+| Web framework | FastAPI 0.115 | Async-native, auto OpenAPI, Pydantic integration |
+| ORM | SQLAlchemy 2.0 async | Industry standard, type-safe, async-first |
+| Migrations | Alembic | Official SQLAlchemy migration tool |
+| DB driver | asyncpg 0.30 | Fastest async PostgreSQL driver for Python |
+| Validation | Pydantic v2 | FastAPI's native validation layer |
+| Config | pydantic-settings | Type-safe env var parsing (equivalent to Zod env schema) |
+| ASGI server | Uvicorn + uvloop | Production-ready async server |
 
-Use Python and FastAPI for both backend services.
+---
 
-**Strongest argument for this choice:** Python is the dominant language for AI/ML work. The Anthropic Python SDK is as mature as the Node.js SDK. FastAPI is modern, performant, and has excellent TypeScript-like type hints via Pydantic.
+## Alternatives Reconsidered
 
-**Why not chosen:**
-1. The shared-types package is TypeScript. Using Python would mean maintaining a separate Pydantic schema definition duplicating the TypeScript interfaces — a synchronization problem that creates bugs over time.
-2. Rajesh's goal is to strengthen Node.js/TypeScript expertise to be language-agnostic between Python and TypeScript (both are common in AI engineering roles). The AI orchestration work (calling APIs, caching, token tracking) does not require Python-specific ML libraries.
-3. Prisma does not support Python. Switching to SQLAlchemy or Tortoise ORM would add another learning topic.
+### Keep Node.js + TypeScript
+**Why not:** Developer velocity matters more than language consistency for a solo learning project. Python expertise is a core portfolio goal. The shared-types benefit does not outweigh the cost of writing backend code in a secondary language.
 
-**Future note:** If the project ever adds a feature requiring local model inference or ML pipeline work, adding a Python microservice for that specific capability is a viable evolution.
+### Django + Django REST Framework
+**Why not:** Django is synchronous by default (async support added later, incomplete). DRF has significant boilerplate. FastAPI is a better fit for a microservice API with explicit schema control.
 
-### .NET 8 (C#) with ASP.NET Core
-
-Use .NET 8 and ASP.NET Core for both backend services.
-
-**Strongest argument for this choice:** .NET 8 is a high-performance, production-grade platform with excellent TypeScript interop via OpenAPI code generation. For enterprise environments (which Rajesh targets), .NET expertise is valuable. Rajesh has prior exposure to .NET.
-
-**Why not chosen:**
-1. The Anthropic SDK does not have an official .NET client. An unofficial community package exists but is less maintained.
-2. Prisma does not support .NET. Would need to use Entity Framework Core instead, adding complexity and reducing the SQL control that Prisma provides.
-3. The monorepo value proposition (shared TypeScript types) breaks down with .NET. Types would need to be duplicated or generated via OpenAPI.
-4. For a personal project on a tight learning budget, switching from TypeScript to C# across the stack would require significant ramp-up time that delays AI feature development.
-5. The node_modules ecosystem (ioredis, zod, jest, supertest) is more familiar and faster to work with for this use case.
-
-**Future note:** A .NET microservice for specific enterprise integration features (e.g., connecting to Azure Service Bus or Graph API) would be worth considering in a future phase if those features are needed.
-
-### Go (Golang)
-
-Use Go for both backend services.
-
-**Why not chosen:** Go has excellent performance and a strong ecosystem for HTTP services. However, the Anthropic SDK does not have an official Go client, and Go's type system (while powerful) does not have the same NPM-ecosystem depth for the supporting libraries needed (ioredis equivalent, Prisma equivalent, supertest equivalent). The learning investment in Go is high, and Go expertise is not as directly aligned with Rajesh's target AI PM / FDE roles as TypeScript expertise is.
+### Flask
+**Why not:** Flask is synchronous, lacks built-in data validation, and requires more manual wiring than FastAPI. FastAPI gives more for less code.

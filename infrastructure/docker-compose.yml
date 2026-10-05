@@ -91,8 +91,8 @@ services:
         condition: service_healthy
 
   # ===================================================================
-  # Profile Service — Node.js REST API for profile data
-  # Run natively during development for HMR; use this for integration testing
+  # Profile Service — Python FastAPI REST API for profile data
+  # Run natively during development for hot reload; use this for integration testing
   # ===================================================================
   profile-service:
     build:
@@ -105,29 +105,20 @@ services:
       NODE_ENV: development
       PORT: 3001
       DATABASE_URL: postgresql://postgres:password@postgres:5432/rajesh_profile_dev
-      REDIS_URL: redis://:redispassword@redis:6379
       ALLOWED_ORIGINS: http://localhost:3000,http://localhost:4200
-      SMTP_HOST: smtp.sendgrid.net
-      SMTP_PORT: '587'
-      SMTP_USER: apikey
-      SMTP_PASS: ${SMTP_PASS:-placeholder}
       CONTACT_EMAIL_TO: rajeshkumar@example.com
-      RATE_LIMIT_WINDOW_MS: '3600000'
-      RATE_LIMIT_MAX_REQUESTS: '10'
     ports:
       - '3001:3001'
     volumes:
       - ../backend/profile-service:/app
-      - /app/node_modules
+      - /app/.venv
     networks:
       - rajesh-profile-network
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     healthcheck:
-      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:3001/health']
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:3001/health")']
       interval: 30s
       timeout: 10s
       retries: 3

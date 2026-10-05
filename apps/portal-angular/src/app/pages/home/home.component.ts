@@ -9,6 +9,7 @@ import { CertificationsComponent } from '../../components/certifications/certifi
 import { ResumeComponent } from '../../components/resume/resume.component';
 import { ContactComponent } from '../../components/contact/contact.component';
 import { FooterComponent } from '../../components/footer/footer.component';
+import { JdOptimizerComponent } from '../../components/jd-optimizer/jd-optimizer.component';
 
 @Component({
   selector: 'app-home',
@@ -24,6 +25,7 @@ import { FooterComponent } from '../../components/footer/footer.component';
     ResumeComponent,
     ContactComponent,
     FooterComponent,
+    JdOptimizerComponent,
   ],
   template: `
     <app-navbar />
@@ -38,6 +40,7 @@ import { FooterComponent } from '../../components/footer/footer.component';
       <app-contact />
     </main>
     <app-footer />
+    <app-jd-optimizer />
   `,
   styles: [],
 })
